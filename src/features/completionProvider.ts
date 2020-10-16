@@ -3,25 +3,36 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { CompletionItemProvider, TextDocument, Position, CompletionContext, CompletionList, CompletionItem, MarkdownString, TextEdit, Range, SnippetString } from "vscode";
+import { CompletionItemProvider, TextDocument, Position, CompletionContext, CompletionList, CompletionItem, MarkdownString, TextEdit, Range, SnippetString, window, Selection } from "vscode";
 import AbstractProvider from "./abstractProvider";
 import * as protocol from "../omnisharp/protocol";
 import * as serverUtils from '../omnisharp/utils';
 import { CancellationToken, CompletionTriggerKind as LspCompletionTriggerKind, InsertTextFormat } from "vscode-languageserver-protocol";
 import { createRequest } from "../omnisharp/typeConversion";
+import OptionProvider from "../observers/OptionProvider";
+import { LanguageMiddlewareFeature } from "../omnisharp/LanguageMiddlewareFeature";
+import { OmniSharpServer } from "../omnisharp/server";
+
+export const CompletionAfterInsertCommand = "csharp.completion.afterInsert";
 
 export default class OmnisharpCompletionProvider extends AbstractProvider implements CompletionItemProvider {
 
     #lastCompletions?: Map<CompletionItem, protocol.OmnisharpCompletionItem>;
 
+    constructor(server: OmniSharpServer, private optionProvider: OptionProvider, languageMiddlewareFeature: LanguageMiddlewareFeature) {
+        super(server, languageMiddlewareFeature);
+    }
+
     public async provideCompletionItems(document: TextDocument, position: Position, token: CancellationToken, context: CompletionContext): Promise<CompletionList> {
         let request = createRequest<protocol.CompletionRequest>(document, position);
         request.CompletionTrigger = (context.triggerKind + 1) as LspCompletionTriggerKind;
         request.TriggerCharacter = context.triggerCharacter;
+        const options = this.optionProvider.GetLatestOptions();
+        request.UseAsyncCompletion = options.enableAsyncCompletion;
 
         try {
             const response = await serverUtils.getCompletion(this._server, request, token);
-            const mappedItems = response.Items.map(this._convertToVscodeCompletionItem);
+            const mappedItems = response.Items.map(arg => this._convertToVscodeCompletionItem(arg, options.enableAsyncCompletion));
 
             let lastCompletions = new Map();
 
@@ -52,14 +63,44 @@ export default class OmnisharpCompletionProvider extends AbstractProvider implem
         const request: protocol.CompletionResolveRequest = { Item: lspItem };
         try {
             const response = await serverUtils.getCompletionResolve(this._server, request, token);
-            return this._convertToVscodeCompletionItem(response.Item);
+            const wasCreatedWithAsyncCompletion: boolean = !!item.command;
+            return this._convertToVscodeCompletionItem(response.Item, wasCreatedWithAsyncCompletion);
         }
         catch (error) {
             return;
         }
     }
 
-    private _convertToVscodeCompletionItem(omnisharpCompletion: protocol.OmnisharpCompletionItem): CompletionItem {
+    public async afterInsert(item: protocol.OmnisharpCompletionItem) {
+        try {
+            const { document: { fileName }, selection: { active: { line, character } } } = window.activeTextEditor;
+            const response = await serverUtils.getCompletionAfterInsert(this._server, { Item: item, FileName: fileName, Line: line + 1, Column: character + 1 });
+
+            if (!response.Change || !response.Column || !response.Line) {
+                return;
+            }
+
+            const applied = await window.activeTextEditor.edit(editBuilder => {
+                const replaceRange = new Range(response.Change.StartLine - 1, response.Change.StartColumn - 1, response.Change.EndLine - 1, response.Change.EndColumn - 1);
+                editBuilder.replace(replaceRange, response.Change.NewText);
+            });
+
+            if (!applied) {
+                return;
+            }
+
+            const responseLine = response.Line - 1;
+            const responseColumn = response.Column - 1;
+
+            const finalPosition = new Position(responseLine, responseColumn);
+            window.activeTextEditor.selections = [new Selection(finalPosition, finalPosition)];
+        }
+        catch (error) {
+            return;
+        }
+    }
+
+    private _convertToVscodeCompletionItem(omnisharpCompletion: protocol.OmnisharpCompletionItem, enableAsyncCompletion: boolean): CompletionItem {
         const docs: MarkdownString | undefined = omnisharpCompletion.Documentation ? new MarkdownString(omnisharpCompletion.Documentation, false) : undefined;
 
         const mapRange = function (edit: protocol.LinePositionSpanTextChange): Range {
@@ -94,7 +135,8 @@ export default class OmnisharpCompletionProvider extends AbstractProvider implem
             tags: omnisharpCompletion.Tags,
             sortText: omnisharpCompletion.SortText,
             additionalTextEdits: additionalTextEdits,
-            keepWhitespace: true
+            keepWhitespace: true,
+            command: enableAsyncCompletion ? { command: CompletionAfterInsertCommand, title: "", arguments: [omnisharpCompletion] } : undefined
         };
     }
 }
