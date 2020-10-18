@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { CompletionItemProvider, TextDocument, Position, CompletionContext, CompletionList, CompletionItem, MarkdownString, TextEdit, Range, SnippetString, window, Selection } from "vscode";
+import { CompletionItemProvider, TextDocument, Position, CompletionContext, CompletionList, CompletionItem, MarkdownString, TextEdit, Range, SnippetString, window, Selection, WorkspaceEdit, workspace } from "vscode";
 import AbstractProvider from "./abstractProvider";
 import * as protocol from "../omnisharp/protocol";
 import * as serverUtils from '../omnisharp/utils';
@@ -73,18 +73,23 @@ export default class OmnisharpCompletionProvider extends AbstractProvider implem
 
     public async afterInsert(item: protocol.OmnisharpCompletionItem) {
         try {
-            const { document: { fileName }, selection: { active: { line, character } } } = window.activeTextEditor;
+            const { document: { fileName, uri }, selection: { active: { line, character } } } = window.activeTextEditor;
             const response = await serverUtils.getCompletionAfterInsert(this._server, { Item: item, FileName: fileName, Line: line + 1, Column: character + 1 });
 
             if (!response.Change || !response.Column || !response.Line) {
                 return;
             }
 
-            const applied = await window.activeTextEditor.edit(editBuilder => {
-                const replaceRange = new Range(response.Change.StartLine - 1, response.Change.StartColumn - 1, response.Change.EndLine - 1, response.Change.EndColumn - 1);
-                editBuilder.replace(replaceRange, response.Change.NewText);
-            });
+            let edit = new WorkspaceEdit();
+            edit.set(uri, [{
+                newText: response.Change.NewText,
+                range: new Range(new Position(response.Change.StartLine, response.Change.StartColumn),
+                                 new Position(response.Change.EndLine, response.Change.EndColumn))
+            }]);
 
+            edit = await this._languageMiddlewareFeature.remap("remapWorkspaceEdit", edit, CancellationToken.None);
+
+            const applied = await workspace.applyEdit(edit);
             if (!applied) {
                 return;
             }
